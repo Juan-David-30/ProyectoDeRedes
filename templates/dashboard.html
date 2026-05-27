@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Controlador SDN - Proyect redes</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="shortcut icon" href="https://cdn-icons-png.flaticon.com/512/1239/1239719.png" type="image/x-icon">
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen font-sans">
+  
+  <header class="bg-gradient-to-r from-indigo-900 to-cyan-800 p-6 border-b border-indigo-500/40 shadow-xl">
+    <div class="max-w-7xl mx-auto flex justify-between items-center">
+      <div>
+        <h1 class="text-3xl font-black tracking-tight">SDN Controller & Traffic Analyzer</h1>
+        <p class="text-indigo-200 text-xs mt-1">Plano de Control Centralizado con Telemetría Nativa</p>
+      </div>
+      <div class="bg-slate-800/90 border border-indigo-500/30 p-3 rounded-lg text-xs font-mono text-cyan-400 animate-pulse">
+        ● CONTROLADOR ONLINE
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-7xl mx-auto p-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
+    
+    <div class="lg:col-span-12 grid grid-cols-1 md:grid-cols-4 gap-4 bg-slate-800/50 p-4 rounded-xl border border-slate-700/60 shadow-md">
+      <div class="bg-slate-900 p-4 rounded-lg border border-slate-700 text-center">
+        <div class="text-xs font-bold text-slate-400 uppercase">Tráfico Total Analizado</div>
+        <div id="metric-total" class="text-3xl font-black text-cyan-400 mt-1">0</div>
+      </div>
+      <div class="bg-slate-900 p-4 rounded-lg border border-slate-700 text-center">
+        <div class="text-xs font-bold text-slate-400 uppercase">Flujos Permitidos (Aceptados)</div>
+        <div id="metric-allow" class="text-3xl font-black text-emerald-400 mt-1">0</div>
+      </div>
+      <div class="bg-slate-900 p-4 rounded-lg border border-slate-700 text-center">
+        <div class="text-xs font-bold text-slate-400 uppercase">Flujos Mitigados (Firewall Drop)</div>
+        <div id="metric-drop" class="text-3xl font-black text-rose-400 mt-1">0</div>
+      </div>
+      <div class="bg-slate-900 p-4 rounded-lg border border-slate-700 text-center">
+        <div class="text-xs font-bold text-slate-400 uppercase">Tasa de Mitigación Actual</div>
+        <div id="metric-ratio" class="text-3xl font-black text-amber-400 mt-1">0%</div>
+      </div>
+    </div>
+
+    <div class="lg:col-span-4 flex flex-col gap-6">
+      <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg">
+        <h2 class="text-sm font-bold text-indigo-400 uppercase tracking-wider mb-3">Agentes Clientes en LAN</h2>
+        <div id="nodesContainer" class="space-y-2 text-xs"></div>
+      </div>
+
+      <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg">
+        <h2 class="text-sm font-bold text-indigo-400 uppercase tracking-wider mb-3">Inyector de Reglas</h2>
+        <form id="ruleForm" class="space-y-3 text-xs">
+          <input type="text" id="note" placeholder="Nota/Propósito" required class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-slate-200 focus:border-indigo-500 focus:outline-none">
+          <div class="grid grid-cols-2 gap-2">
+            <select id="ipProto" class="w-full bg-slate-900 border border-slate-700 rounded p-2 focus:border-indigo-500 focus:outline-none">
+              <option value="*">Cualquier Proto</option>
+              <option value="TCP">TCP</option>
+              <option value="UDP">UDP</option>
+            </select>
+            <input type="text" id="tpDst" value="*" placeholder="Puerto (ej: 5000)" class="w-full bg-slate-900 border border-slate-700 rounded p-2 focus:border-indigo-500 focus:outline-none">
+          </div>
+          <div class="grid grid-cols-2 gap-2">
+            <select id="action" class="w-full bg-slate-900 border border-slate-700 rounded p-2 focus:border-indigo-500 focus:outline-none">
+              <option value="forward">Permitir (ALLOW)</option>
+              <option value="drop">Bloquear (DROP)</option>
+              <option value="controller">Reportar (ALERT)</option>
+            </select>
+            <select id="priority" class="w-full bg-slate-900 border border-slate-700 rounded p-2 focus:border-indigo-500 focus:outline-none">
+              <option value="Alta">Prioridad Alta (3)</option>
+              <option value="Media" selected>Prioridad Media (2)</option>
+              <option value="Baja">Prioridad Baja (1)</option>
+            </select>
+          </div>
+          <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold p-2 rounded transition">Inyectar Regla de Flujo</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="lg:col-span-8 flex flex-col gap-6">
+      <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg">
+        <h2 class="text-sm font-bold text-indigo-400 uppercase tracking-wider mb-3">Tabla de Flujo Activa (Políticas SDN)</h2>
+        <div class="overflow-x-auto text-xs">
+          <table class="w-full text-left">
+            <thead class="bg-slate-900 text-slate-400 uppercase text-[10px]">
+              <tr>
+                <th class="p-2.5">Propósito</th>
+                <th class="p-2.5">Proto</th>
+                <th class="p-2.5">Puerto</th>
+                <th class="p-2.5">Acción</th>
+                <th class="p-2.5">Prioridad</th>
+                <th class="p-2.5 text-center">Hits</th>
+                <th class="p-2.5 text-center">Acciones</th>
+              </tr>
+            </thead>
+            <tbody id="rulesTableBody" class="divide-y divide-slate-700/40"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg flex-1 flex flex-col">
+        <h2 class="text-sm font-bold text-amber-400 uppercase tracking-wider mb-2">Historial del Analizador de Tráfico en LAN</h2>
+        <div id="logsContainer" class="bg-slate-950 p-4 font-mono text-xs rounded-lg flex-1 overflow-y-auto max-h-60 border border-slate-900 space-y-1"></div>
+      </div>
+    </div>
+
+  </main>
+
+<script>
+    /**
+     * Sincronización Asíncrona Global (Telemetry Pulling):
+     * Consulta periódicamente al Plano de Control para obtener el estado del inventario de nodos,
+     * la Flow Table activa, los registros de auditoría y las métricas estadísticas globales.
+     */
+    async function updateDashboard() {
+      try {
+        // Ejecuta una petición HTTP GET de forma asíncrona hacia el endpoint unificado del controlador
+        const res = await fetch('/api/dashboard');
+        const data = await res.json(); // Deserializa el flujo JSON de respuesta
+        
+        // --- SECCIÓN 1: INYECCIÓN DE MÉTRICAS ANALÍTICAS (Dashboard) ---
+        // Actualiza los elementos contenedores con los datos acumulados por el Analizador de Tráfico
+        document.getElementById('metric-total').innerText = data.analiticas.total_paquetes;
+        document.getElementById('metric-allow').innerText = data.analiticas.paquetes_permitidos;
+        document.getElementById('metric-drop').innerText = data.analiticas.paquetes_bloqueados;
+        
+        // Algoritmo para calcular la tasa de mitigación (Ratio de Bloqueo) evitando divisiones por cero
+        const ratio = data.analiticas.total_paquetes > 0 
+          ? Math.round((data.analiticas.paquetes_bloqueados / data.analiticas.total_paquetes) * 100) 
+          : 0;
+        document.getElementById('metric-ratio').innerText = ratio + "%";
+
+        // --- SECCIÓN 2: RENDERIZADO DEL INVENTARIO DE NODOS (Topología) ---
+        const nodesDiv = document.getElementById('nodesContainer');
+        // Evalúa si existen agentes SDN enlazados en la LAN
+        nodesDiv.innerHTML = Object.keys(data.nodos).length === 0 
+          ? '<p class="italic text-slate-500">Esperando nodos...</p>' 
+          : Object.entries(data.nodos).map(([ip, n]) => `
+              <div class="bg-slate-900 p-2 rounded border border-slate-700 flex justify-between">
+                <span>
+                  <b>${n.nombre}</b> <br>
+                  <small class="text-slate-400">${ip}</small>
+                </span>
+                <span class="text-emerald-400 font-bold self-center">ONLINE</span>
+              </div>
+            `).join(''); // El método .join('') unifica el array de strings para evitar comas residuales en el HTML
+
+        // --- SECCIÓN 3: RENDERIZADO DINÁMICO DE LA FLOW TABLE ---
+        // Mapea la lista de reglas ordenadas por prioridad y construye las filas de la tabla
+        document.getElementById('rulesTableBody').innerHTML = data.reglas.map(r => `
+          <tr class="hover:bg-slate-700/20">
+            <td class="p-2.5 font-bold">${r.note}</td>
+            <td class="p-2.5 font-mono">${r.ipProto}</td>
+            <td class="p-2.5 font-mono">${r.tpDst}</td>
+            <td class="p-2.5">
+              <span class="px-2 py-0.5 rounded border text-[10px] font-bold ${
+                r.action === 'drop' 
+                  ? 'bg-rose-950 text-rose-400 border-rose-800' 
+                  : 'bg-emerald-950 text-emerald-400 border-emerald-800'
+              }">
+                ${r.action.toUpperCase()}
+              </span>
+            </td>
+            <td class="p-2.5">${r.priority}</td>
+            <td class="p-2.5 text-center font-bold text-cyan-400 font-mono">${r.packets}</td>
+            <td class="p-2.5 text-center">
+              <button onclick="deleteRule('${r.id}')" class="text-rose-400 font-bold hover:underline">Eliminar</button>
+            </td>
+          </tr>
+        `).join('');
+
+        // --- SECCIÓN 4: VISOR DE EVENTOS DE RED EN TIEMPO REAL (Logs Logísticos) ---
+        const logsDiv = document.getElementById('logsContainer');
+        logsDiv.innerHTML = data.logs.length === 0 
+          ? '<p class="text-slate-600">[ESPERANDO DATOS DE TELEMETRÍA]</p>' 
+          : data.logs.map(l => {
+              // Motor de formateo semántico: Asigna colores basados en el veredicto del paquete
+              let color = "text-slate-300";
+              if (l.includes("DROP")) color = "text-rose-400";
+              if (l.includes("ALERT")) color = "text-amber-400 font-bold";
+              if (l.includes("ALLOW")) color = "text-emerald-400";
+              return `<div class="${color}">${l}</div>`;
+            }).join('');
+            
+        // Autoscroll: Desplaza automáticamente el contenedor al fondo para visualizar el tráfico más reciente
+        logsDiv.scrollTop = logsDiv.scrollHeight;
+
+      } catch(e) { 
+        console.error("[-] Error en el ciclo de actualización de telemetría: ", e); 
+      }
+    }
+
+    // --- SECCIÓN 5: CAPTURA E INYECCIÓN DE NUEVAS POLÍTICAS EN CALIENTE ---
+    // Intercepta el evento de envío del formulario para procesarlo mediante AJAX/Fetch sin refrescar la ventana
+    document.getElementById('ruleForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      
+      // Capturamos los valores asegurando que si están vacíos, usen el comodín "*"
+      const noteVal = document.getElementById('note').value.strip ? document.getElementById('note').value.trim() : document.getElementById('note').value;
+      const protoVal = document.getElementById('ipProto').value || "*";
+      const portVal = document.getElementById('tpDst').value || "*";
+      const actionVal = document.getElementById('action').value || "forward";
+      
+      // Forzamos la conversión a entero de la prioridad. Si falla, por defecto es 1 (Baja)
+      const priorityVal = parseInt(document.getElementById('priority').value, 10) || 1;
+
+      // CONSTRUIMOS EL PAYLOAD COMPLETO
+      // Incluimos ipSrc e ipDst para cumplir estrictamente con el esquema del servidor
+      const payload = {
+        id: "",
+        note: noteVal || "Nueva Regla de Flujo",
+        ipSrc: "*",       // Requerido por el modelo de Pydantic
+        ipDst: "*",       // Requerido por el modelo de Pydantic
+        ipProto: protoVal,
+        tpDst: portVal.toString(), // Nos aseguramos de que el puerto viaje como Texto/String
+        action: actionVal,
+        priority: priorityVal,
+        packets: 0
+      };
+
+      console.log("Enviando este JSON al servidor:", payload); // Para auditoría en la consola del navegador (F12)
+
+      try {
+        const response = await fetch('/api/rules', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(payload)
+        });
+
+        if (response.ok) {
+          console.log("[+] Regla inyectada exitosamente.");
+          document.getElementById('ruleForm').reset();
+          updateDashboard();
+        } else {
+          const errorData = await response.json();
+          console.error("[-] Error detallado del servidor:", errorData);
+        }
+      } catch (error) {
+        console.error("[-] Error de red:", error);
+      }
+    });
+    // --- SECCIÓN 6: BAJA Y REMOCIÓN DE REGLAS DE FLUJO ---
+    /**
+     * Despacha una petición de eliminación hacia el controlador usando la API RESTful.
+     * @param {string} id - Hash identificador de la regla a dar de baja.
+     */
+    async function deleteRule(id) {
+      await fetch(`/api/rules/${id}`, { method: 'DELETE' });
+      updateDashboard(); // Sincroniza visualmente la Flow Table de forma inmediata
+    }
+
+    // --- SECCIÓN 7: TEMPORIZADOR DE REFRESCO DE LA APLICACIÓN (Polling Rate) ---
+    // Configura un ciclo de ejecución automática que invoca el refresco cada 1000 milisegundos (1 segundo).
+    // Esto simula un flujo de actualización casi en tiempo real ("Near Real-Time Telemetry Loop").
+    setInterval(updateDashboard, 1000);
+</script>
+</body>
+</html>
