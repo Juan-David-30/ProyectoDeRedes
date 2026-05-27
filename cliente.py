@@ -1,143 +1,196 @@
 # Importamos las librerías de utilidades necesarias
+import sys
+import time
+import socket
+import threading
+import requests
 
-import sys          # Permite interactuar con variables del sistema (captura de argumentos por consola)
-import time         # Gestión de temporizadores y suspensiones de hilos (sleep)
-import socket       # Núcleo de bajo nivel para la manipulación de Sockets de red de Berkeley (Capa 4)
-import threading    # Hilos de ejecución paralela para evitar bloqueos en la escucha mutiprocolo
-import requests     # Cliente HTTP para el canal de control (comunicación descendente hacia el servidor)
-
-# --- CAPTURA DE PARÁMETROS DE ARRANQUE E INTERFAZ CLI ---
-# Inicialización de variables globales para la identidad de red del host agente
+# --- CAPTURA DE PARÁMETROS DE ARRANQUE ---
 NOMBRE = ""
 PUERTO = 0
 
-# Bucle de validación interactiva para asignar un identificador unívoco al nodo
-while True: 
+while True:
     NOMBRE = input("Ingresar un nombre para el nodo (e.g. NodoAlpha): ")
-    if NOMBRE.strip() != "":
+    if NOMBRE.strip():
         break
 
-# Bucle de validación para el puerto local de escucha del switch/firewall virtual
-while True: 
+while True:
     try:
         PUERTO = int(input("Ingresar puerto de escucha local (e.g. 5000): "))
-        if 65536 > PUERTO > 0:  # Restricción técnica del rango de puertos TCP/UDP
+        if 0 < PUERTO < 65536:
             break
         print("[-] Puerto inválido. Debe estar entre 1 y 65535.")
     except ValueError:
         print("[-] Por favor ingrese un número entero.")
 
-# Estructura de configuración local del agente
 CONFIG = {
     "NOMBRE_NODO": NOMBRE,
-    "CONTROLADOR_URL": "http://127.0.0.1:8000", # Cambiar por la IP privada LAN del servidor controlador
+    "CONTROLADOR_URL": "http://127.0.0.1:8000",  # Cambiar por IP privada LAN del servidor
     "PUERTO_ESCUCHA": PUERTO,
-    "SYNC_INTERVAL": 4  # Frecuencia de refresco (en segundos) para la Flow Table (Pull-based architecture)
+    "SYNC_INTERVAL": 4,   # Segundos entre sincronizaciones de la Flow Table
 }
+
 
 class AgenteSDN:
     """
-    Abstracción del Plano de Datos. Modela el comportamiento de un conmutador programable
-    con capacidades de filtrado de paquetes de estado simple (Stateless Firewall).
+    Abstracción del Plano de Datos.
+    Modela un conmutador programable con firewall stateless y motor de reglas SDN.
+    Admite prioridades en el rango [0, 100] y campos de coincidencia extendidos
+    (ipSrc, ipDst, ipProto, tpSrc, tpDst).
     """
+
     def __init__(self):
-        self.reglas = []       # Flow Table local (Caché sincronizada desde el controlador)
-        self.running = True    # Bandera de control para los hilos de ejecución
+        self.reglas = []
+        self.running = True
+
+    # ------------------------------------------------------------------
+    # REGISTRO Y SINCRONIZACIÓN CON EL CONTROLADOR
+    # ------------------------------------------------------------------
 
     def registrar_agente(self):
-        """
-        Fase de Descubrimiento de Topología: Envía una notificación HTTP POST al 
-        controlador para dar de alta al nodo en el inventario central.
-        """
-        print(f"[*] Sincronizando '{CONFIG['NOMBRE_NODO']}' con el plano de control...")
+        """Fase de descubrimiento: da de alta el nodo ante el controlador."""
+        print(f"[*] Registrando '{CONFIG['NOMBRE_NODO']}' en el plano de control...")
         try:
             r = requests.post(
-                f"{CONFIG['CONTROLADOR_URL']}/api/nodes/register", 
-                json={"nombre": CONFIG['NOMBRE_NODO']}, 
-                timeout=4
+                f"{CONFIG['CONTROLADOR_URL']}/api/nodes/register",
+                json={"nombre": CONFIG["NOMBRE_NODO"]},
+                timeout=4,
             )
             if r.status_code == 200:
                 print("[+] Registro exitoso ante el Controlador.")
         except Exception as e:
-            print(f"[-] Error de conexión inicial con el controlador: {e}")
+            print(f"[-] Error de conexión inicial: {e}")
 
     def hilo_pull_reglas(self):
         """
-        Canal de Control Descendente: Descarga de forma iterativa y periódica las 
-        políticas vigentes en la Flow Table centralizada.
+        Canal de control descendente (Pull-based).
+        Descarga periódicamente las políticas vigentes desde el controlador.
+        Las reglas ya vienen ordenadas de mayor a menor prioridad.
         """
         while self.running:
             try:
-                r = requests.get(f"{CONFIG['CONTROLADOR_URL']}/api/rules", timeout=3)
+                r = requests.get(
+                    f"{CONFIG['CONTROLADOR_URL']}/api/rules", timeout=3
+                )
                 if r.status_code == 200:
-                    self.reglas = r.json()  # Actualiza la Flow Table local en caliente
-                    print(f"[SDN] Sincronizadas {len(self.reglas)} reglas de flujo desde el controlador.")
+                    self.reglas = r.json()
+                    print(
+                        f"[SDN] Sincronizadas {len(self.reglas)} reglas "
+                        f"(mayor prioridad: "
+                        f"{self.reglas[0]['priority'] if self.reglas else 'N/A'})."
+                    )
             except Exception as e:
-                print(f"[-] Canal de control inaccesible (reintentando...): {e}")
+                print(f"[-] Canal de control inaccesible: {e}")
             time.sleep(CONFIG["SYNC_INTERVAL"])
+
+    # ------------------------------------------------------------------
+    # MOTOR DE FIREWALL / COINCIDENCIA DE REGLAS
+    # ------------------------------------------------------------------
 
     def motor_firewall(self, raw_data, addr, proto):
         """
-        Motor de Inspección de Flujos (Core SDN): Evalúa cada paquete interceptado en la 
-        interfaz contra la Flow Table local utilizando algoritmos de coincidencia de primer orden.
+        Motor de inspección de flujos (core SDN).
+
+        Evalúa cada paquete contra la Flow Table local usando coincidencia de
+        primer orden sobre reglas pre-ordenadas de mayor a menor prioridad [0-100].
+
+        Campos evaluados:
+          - ipSrc  : IP de origen del paquete
+          - ipDst  : IP de destino (la interfaz local del agente)
+          - ipProto: Protocolo de transporte (TCP / UDP)
+          - tpSrc  : Puerto de origen del emisor
+          - tpDst  : Puerto de destino (el puerto de escucha del agente)
         """
-        ip_src = addr[0]  # Extrae la dirección IP de origen del host remoto atacante/generador
-        msg = raw_data.decode('utf-8', errors='ignore') # Decodifica el payload (Deep Packet Inspection conceptual)
-        print(f"\n[EVALUANDO FLUJO] {proto} desde {ip_src}:{addr[1]} hacia Puerto Local {CONFIG['PUERTO_ESCUCHA']}")
+        ip_src = addr[0]
+        port_src = str(addr[1])
+        ip_dst_local = self._get_local_ip()      # IP local del agente (destino del flujo)
+        msg = raw_data.decode("utf-8", errors="ignore")
+
+        print(
+            f"\n[FLUJO] {proto} | {ip_src}:{port_src} → "
+            f"{ip_dst_local}:{CONFIG['PUERTO_ESCUCHA']}"
+        )
 
         regla_ganadora = None
-        
-        # EVALUACIÓN DE REGLAS POR PRIORIDAD:
-        # Al venir pre-ordenadas de Alta a Baja por el servidor, la primera coincidencia estructural toma el control.
-        for regla in self.reglas:
-            # 1. Coincidencia de Capa 4 (Protocolo de Transporte)
-            match_proto = (regla["ipProto"] == "*" or regla["ipProto"].upper() == proto.upper())
-            # 2. Coincidencia de Capa 4 (Puerto de Destino del servicio local)
-            match_port = (regla["tpDst"] == "*" or int(regla["tpDst"]) == CONFIG['PUERTO_ESCUCHA'])
-            # 3. Coincidencia de Capa 3 (Dirección IP de Origen - Agregado para cumplir la guía)
-            match_ip_src = (regla["ipSrc"] == "*" or regla["ipSrc"] == ip_src)
-            
-            # Si el paquete cumple con todos los campos de coincidencia (Match Fields) de OpenFlow
-            if match_proto and match_port and match_ip_src:
-                regla_ganadora = regla
-                break
 
-        # Valores restrictivos por defecto en caso de no coincidir con ninguna política explícita
-        accion_final = "DROP" 
-        note_regla = "Política restrictiva por defecto de la arquitectura"
+        for regla in self.reglas:
+            # 1. Coincidencia de protocolo (Capa 4)
+            match_proto = (
+                regla["ipProto"] == "*"
+                or regla["ipProto"].upper() == proto.upper()
+            )
+            # 2. Coincidencia de IP de origen (Capa 3)
+            match_ip_src = (
+                regla["ipSrc"] == "*" or regla["ipSrc"] == ip_src
+            )
+            # 3. Coincidencia de IP de destino (Capa 3)
+            match_ip_dst = (
+                regla["ipDst"] == "*" or regla["ipDst"] == ip_dst_local
+            )
+            # 4. Coincidencia de puerto de origen (Capa 4)
+            match_tp_src = (
+                regla.get("tpSrc", "*") == "*"
+                or regla.get("tpSrc", "*") == port_src
+            )
+            # 5. Coincidencia de puerto de destino (Capa 4)
+            match_tp_dst = (
+                regla["tpDst"] == "*"
+                or int(regla["tpDst"]) == CONFIG["PUERTO_ESCUCHA"]
+            )
+
+            if match_proto and match_ip_src and match_ip_dst and match_tp_src and match_tp_dst:
+                regla_ganadora = regla
+                break   # Primera coincidencia gana (reglas ya ordenadas por prioridad desc.)
+
+        # Política restrictiva por defecto (Default-Deny)
+        accion_final = "DROP"
+        note_regla = "Política por defecto (ninguna regla coincidió)"
         rule_id = None
 
         if regla_ganadora:
             rule_id = regla_ganadora["id"]
             note_regla = regla_ganadora["note"]
-            if regla_ganadora["action"] == "forward":
-                accion_final = "ALLOW"
-            elif regla_ganadora["action"] == "drop":
-                accion_final = "DROP"
-            elif regla_ganadora["action"] == "controller":
-                accion_final = "ALERT"
+            accion_map = {
+                "forward":    "ALLOW",
+                "drop":       "DROP",
+                "controller": "ALERT",
+            }
+            accion_final = accion_map.get(regla_ganadora["action"], "DROP")
 
-        # REPORTAR HIT DE REGLA: Incrementa de forma discreta el contador de telemetría de la política afectada
+        # Reportar hit de regla al controlador (telemetría por regla)
         if rule_id:
-            try: requests.post(f"{CONFIG['CONTROLADOR_URL']}/api/rules/match/{rule_id}", timeout=1)
-            except: pass
+            try:
+                requests.post(
+                    f"{CONFIG['CONTROLADOR_URL']}/api/rules/match/{rule_id}",
+                    timeout=1,
+                )
+            except:
+                pass
 
-        # EJECUCIÓN DE LA ACCIÓN A NIVEL DE DATOS:
-        if accion_final in ["ALLOW", "ALERT"]:
-            print(f"[+] [{accion_final}] Flujo PROCESADO exitosamente por regla: '{note_regla}'")
-            print(f"    Payload útil del paquete: '{msg}'")
+        # Ejecutar acción
+        if accion_final in ("ALLOW", "ALERT"):
+            print(f"[+] [{accion_final}] Regla: '{note_regla}'")
+            print(f"    Payload: '{msg[:80]}'")
         else:
-            print(f"[-] [DROP] Tráfico MITIGADO (Purgado silenciosamente) por regla: '{note_regla}'")
+            print(f"[-] [DROP] Regla: '{note_regla}' — paquete descartado silenciosamente.")
 
-        # ENVIAR EVENTO AL ANALIZADOR DE TRÁFICO CENTRALIZADO (Telemetría global para el Dashboard)
-        # Convertimos ALERT a ALLOW a nivel de flujo para no romper los contadores del frontend, manteniendo el log intacto.
-        self.reportar_al_analizador(proto, ip_src, "ALLOW" if accion_final == "ALERT" else accion_final, msg)
+        # Reportar evento al analizador de tráfico (telemetría global)
+        # ALERT se reporta como ALERT para que el servidor incremente alertas_criticas
+        self.reportar_al_analizador(proto, ip_src, accion_final, msg)
+
+    def _get_local_ip(self) -> str:
+        """Obtiene la IP local principal del agente para la coincidencia de ipDst."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except:
+            return "127.0.0.1"
 
     def reportar_al_analizador(self, proto, ip_src, accion, msg):
-        """
-        Canal de Control Ascendente: Reporta de forma asíncrona un informe detallado
-        del paquete al analizador de telemetría del controlador.
-        """
+        """Canal de control ascendente: envía telemetría al controlador."""
         try:
             payload = {
                 "nodo": CONFIG["NOMBRE_NODO"],
@@ -145,69 +198,84 @@ class AgenteSDN:
                 "puerto": CONFIG["PUERTO_ESCUCHA"],
                 "origen": ip_src,
                 "accion_tomada": accion,
-                "payload": msg
+                "payload": msg[:200],
             }
-            requests.post(f"{CONFIG['CONTROLADOR_URL']}/api/analyzer/report", json=payload, timeout=2)
-        except Exception as e:
-            # Falla silenciosa en consola para evitar que problemas de red HTTP bloqueen el plano de datos
+            requests.post(
+                f"{CONFIG['CONTROLADOR_URL']}/api/analyzer/report",
+                json=payload,
+                timeout=2,
+            )
+        except:
             pass
 
-    # --- ENTRADAS MULTI-HILO (Interfaces de Escucha del Plano de Datos) ---
+    # ------------------------------------------------------------------
+    # INTERFACES DE ESCUCHA (PLANO DE DATOS)
+    # ------------------------------------------------------------------
 
     def socket_udp_listener(self):
-        """Abre un canal de escucha de datagramas UDP sin conexión en el puerto asignado."""
+        """Canal UDP sin conexión."""
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.bind(("0.0.0.0", CONFIG["PUERTO_ESCUCHA"])) # Escucha en todas las interfaces físicas
+        s.bind(("0.0.0.0", CONFIG["PUERTO_ESCUCHA"]))
+        print(f"[UDP] Escuchando en 0.0.0.0:{CONFIG['PUERTO_ESCUCHA']}")
         while self.running:
             try:
-                data, addr = s.recvfrom(4096)  # Intercepta el buffer de datos entrante
-                # Delega la evaluación de forma asíncrona a un hilo nuevo para no encolar el socket
-                threading.Thread(target=self.motor_firewall, args=(data, addr, "UDP"), daemon=True).start()
-            except: pass
+                data, addr = s.recvfrom(4096)
+                threading.Thread(
+                    target=self.motor_firewall,
+                    args=(data, addr, "UDP"),
+                    daemon=True,
+                ).start()
+            except:
+                pass
 
     def socket_tcp_listener(self):
-        """Abre un socket de escucha orientado a conexión TCP en modo pasivo."""
+        """Canal TCP orientado a conexión."""
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Permite la reutilización inmediata del puerto local evitando bloqueos de TIME_WAIT del sistema operativo
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("0.0.0.0", CONFIG["PUERTO_ESCUCHA"]))
-        s.listen(5)  # Define una cola de hasta 5 conexiones concurrentes pendientes
+        s.listen(5)
+        print(f"[TCP] Escuchando en 0.0.0.0:{CONFIG['PUERTO_ESCUCHA']}")
         while self.running:
             try:
-                conn, addr = s.accept() # Captura el saludo de tres vías (Three-way handshake)
+                conn, addr = s.accept()
                 data = conn.recv(4096)
                 if data:
-                    # Deriva la carga útil del segmento TCP al motor de políticas en un hilo independiente
-                    threading.Thread(target=self.motor_firewall, args=(data, addr, "TCP"), daemon=True).start()
-                conn.close() # Cierra el socket de la sesión para liberar recursos
-            except: pass
+                    threading.Thread(
+                        target=self.motor_firewall,
+                        args=(data, addr, "TCP"),
+                        daemon=True,
+                    ).start()
+                conn.close()
+            except:
+                pass
+
+    # ------------------------------------------------------------------
+    # ORQUESTADOR PRINCIPAL
+    # ------------------------------------------------------------------
 
     def arrancar(self):
-        """Orquestador Principal: Inicializa de manera concurrente todos los servicios del nodo."""
         self.registrar_agente()
-        
-        # Despliegue de los hilos demonio (Daemon Threads) de fondo
         threading.Thread(target=self.hilo_pull_reglas, daemon=True).start()
         threading.Thread(target=self.socket_udp_listener, daemon=True).start()
         threading.Thread(target=self.socket_tcp_listener, daemon=True).start()
-        
-        # Mantiene el hilo principal vivo respondiendo a interrupciones del teclado
         try:
-            while self.running: 
+            while self.running:
                 time.sleep(1)
         except KeyboardInterrupt:
-            print("\n[-] Apagando interfaces y saliendo del Agente SDN...")
+            print("\n[-] Apagando el Agente SDN...")
             self.running = False
 
-# --- PUNTO DE ENTRADA AL MÓDULO POR CONSOLA (Desacoplamiento de Configuración) ---
+
+# --- PUNTO DE ENTRADA ---
 if __name__ == "__main__":
-    # Permite sobrescribir la configuración interactiva si el script se arranca pasándole argumentos:
-    # Ejemplo: 'python cliente.py NodoAlpha 5001'
-    if len(sys.argv) > 1: 
+    # Sobrescritura opcional por argumentos de línea de comandos:
+    #   python cliente.py NodoAlpha 5001 http://192.168.1.10:8000
+    if len(sys.argv) > 1:
         CONFIG["NOMBRE_NODO"] = sys.argv[1]
-    if len(sys.argv) > 2: 
+    if len(sys.argv) > 2:
         CONFIG["PUERTO_ESCUCHA"] = int(sys.argv[2])
-    
-    # Instanciación e inicio del servicio
+    if len(sys.argv) > 3:
+        CONFIG["CONTROLADOR_URL"] = sys.argv[3]
+
     agente = AgenteSDN()
     agente.arrancar()
